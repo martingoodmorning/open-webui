@@ -1693,20 +1693,20 @@ async def chat_completion(
                 log.debug(f"Error cleaning up: {e}")
                 pass
 
-    if (
-        metadata.get("session_id")
-        and metadata.get("chat_id")
-        and metadata.get("message_id")
-    ):
-        # Asynchronous Chat Processing
-        task_id, _ = await create_task(
-            request.app.state.redis,
-            process_chat(request, form_data, user, metadata, model),
-            id=metadata["chat_id"],
-        )
-        return {"status": True, "task_id": task_id}
-    else:
-        return await process_chat(request, form_data, user, metadata, model)
+    # NOTE:
+    # 原本这里在 session_id / chat_id / message_id 都存在时，会走异步任务队列：
+    #   - create_task(...) 返回 task_id
+    #   - 前端再通过 /api/tasks/chat/{chat_id} 轮询进度
+    # 但在当前环境下，任务队列 / Redis 配置不完整，导致带文档的聊天拿到 task_id 却查不到结果，
+    # 前端一直卡在“查询中”。为保证功能可用，这里暂时改为**始终同步处理**。
+    #
+    # 后续如果要恢复异步，只需还原为：
+    #   if metadata.get("session_id") and metadata.get("chat_id") and metadata.get("message_id"):
+    #       task_id, _ = await create_task(...)
+    #       return {"status": True, "task_id": task_id}
+    #
+    # 现在统一直接返回模型结果，避免依赖任务队列。
+    return await process_chat(request, form_data, user, metadata, model)
 
 
 # Alias for chat_completion (Legacy)
