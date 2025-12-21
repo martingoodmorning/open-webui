@@ -204,3 +204,204 @@ export const deleteSharedFile = async (token: string, fileId: string) => {
 	return res;
 };
 
+/**
+ * 获取共享 Excel/CSV 文件的结构预览
+ */
+export const getSharedExcelPreview = async (
+	token: string,
+	fileId: string,
+	maxRows: number = 100
+) => {
+	let error: string | null = null;
+
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/files/shared/${fileId}/excel/preview?max_rows=${maxRows}`,
+		{
+			method: 'GET',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				authorization: `Bearer ${token}`
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail || err.message || 'Failed to fetch excel preview';
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+/**
+ * 根据配置获取共享 Excel/CSV 文件的图表数据
+ */
+export const getSharedExcelChart = async (
+	token: string,
+	fileId: string,
+	config: any
+) => {
+	let error: string | null = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/files/shared/${fileId}/excel/chart`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify(config)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail || err.message || 'Failed to build excel chart';
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+/**
+ * 获取内置 Excel 图表模版列表
+ */
+export const getSharedExcelTemplates = async (token: string) => {
+	let error: string | null = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/files/shared/excel/templates`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail || err.message || 'Failed to fetch excel templates';
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+/**
+ * 获取某个共享文件下保存的 Excel 视图列表
+ */
+export const getSharedExcelViews = async (token: string, fileId: string) => {
+	let error: string | null = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/files/shared/${fileId}/excel/views`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		}
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail || err.message || 'Failed to fetch excel views';
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+/**
+ * 保存或更新 Excel 视图
+ */
+export const saveSharedExcelView = async (token: string, fileId: string, payload: any) => {
+	let error: string | null = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/files/shared/${fileId}/excel/views`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify(payload)
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail || err.message || 'Failed to save excel view';
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+/**
+ * 删除 Excel 视图
+ */
+export const deleteSharedExcelView = async (token: string, fileId: string, viewId: string) => {
+	let error: string | null = null;
+
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/files/shared/${fileId}/excel/views/${viewId}`,
+		{
+			method: 'DELETE',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				authorization: `Bearer ${token}`
+			}
+		}
+	)
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail || err.message || 'Failed to delete excel view';
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};

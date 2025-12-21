@@ -2,9 +2,10 @@ import logging
 import os
 import uuid
 import json
+import time
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 import asyncio
 import subprocess
@@ -49,6 +50,7 @@ from open_webui.storage.provider import Storage
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access
+from open_webui.utils.excel_utils import get_excel_structure, build_excel_chart
 
 from pydantic import BaseModel
 
@@ -229,6 +231,498 @@ async def list_shared_files(
         "page": page,
         "page_size": page_size,
     }
+
+
+############################
+# Shared Files - Excel Preview
+############################
+
+
+class ExcelColumn(BaseModel):
+    name: str
+    type: str  # number | category | datetime
+
+
+class ExcelSheetPreview(BaseModel):
+    name: str
+    columns: list[ExcelColumn]
+    sample_rows: list[list]
+    total_rows: int
+    truncated: bool
+
+
+class ExcelFilePreviewResponse(BaseModel):
+    sheets: list[ExcelSheetPreview]
+
+
+@router.get("/shared/{file_id}/excel/preview", response_model=ExcelFilePreviewResponse)
+async def preview_shared_excel_file(
+    file_id: str,
+    user=Depends(get_verified_user),
+    max_rows: int = Query(100, ge=1, le=1000, description="每个工作表返回的最大行数"),
+):
+    """获取共享 Excel/CSV 文件的结构预览信息。
+
+    - 仅支持 space_type == "shared" 的文件；
+    - 返回 sheet 列表、列信息、样例数据、总行数等；
+    - 不返回完整数据，用于前端配置图表时的结构展示。
+    """
+
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    try:
+        from open_webui.config import UPLOAD_DIR
+
+        # 解析物理路径
+        if file.path is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File path is empty",
+            )
+
+        if os.path.isabs(file.path):
+            file_path = Path(file.path)
+        else:
+            file_path = Path(UPLOAD_DIR) / file.path
+
+        if not file_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found on disk",
+            )
+
+        # 调用工具函数获取结构
+        structure = get_excel_structure(file_path, max_rows=max_rows)
+
+        # 将 dict 转为响应模型
+        sheets = [
+            ExcelSheetPreview(
+                name=sheet["name"],
+                columns=[
+                    ExcelColumn(name=col["name"], type=col["type"])
+                    for col in sheet.get("columns", [])
+                ],
+                sample_rows=sheet.get("sample_rows", []),
+                total_rows=sheet.get("total_rows", 0),
+                truncated=sheet.get("truncated", False),
+            )
+            for sheet in structure.get("sheets", [])
+        ]
+
+        return ExcelFilePreviewResponse(sheets=sheets)
+
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found on disk",
+        )
+    except ValueError as e:
+        # 不支持的文件类型或解析错误
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(f"Error previewing excel file: {str(e)}"),
+        )
+
+
+class ExcelChartTemplate(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    chart_type: str = "bar"  # bar | line | pie
+    default_agg: str = "sum"  # sum | count | avg
+    preferred_sheet: Optional[str] = None
+    default_x: Optional[str] = None
+    default_y: Optional[str] = None
+    default_series: Optional[str] = None
+
+
+_BUILTIN_EXCEL_TEMPLATES: List[ExcelChartTemplate] = [
+    ExcelChartTemplate(
+        id="out_person_status_overview",
+        name="在外人员状态统计",
+        description="按状态统计在外人员数量（柱状图 / 计数）",
+        chart_type="bar",
+        default_agg="count",
+        preferred_sheet="在外人员统计",
+        default_x="状态",
+        default_y=None,
+        default_series=None,
+    ),
+    ExcelChartTemplate(
+        id="device_type_count",
+        name="设备类型数量统计",
+        description="按设备类型统计设备数量（柱状图 / 求和）",
+        chart_type="bar",
+        default_agg="sum",
+        preferred_sheet="设备数量统计",
+        default_x="设备类型",
+        default_y="数量",
+        default_series=None,
+    ),
+    ExcelChartTemplate(
+        id="out_person_trend",
+        name="在外人数趋势",
+        description="按日期统计在外人数变化（折线图 / 计数）",
+        chart_type="line",
+        default_agg="count",
+        preferred_sheet="在外人员统计",
+        default_x="日期",
+        default_y=None,
+        default_series=None,
+    ),
+]
+
+
+@router.get("/shared/excel/templates", response_model=List[ExcelChartTemplate])
+async def list_excel_chart_templates(user=Depends(get_verified_user)):
+    """获取内置的 Excel 图表模版列表。
+
+    目前仅返回后端内置模版，前端可根据当前文件 / sheet 过滤或应用。
+    """
+
+    return _BUILTIN_EXCEL_TEMPLATES
+
+
+class ExcelFilter(BaseModel):
+    field: str
+    op: str  # eq | in | neq | gte | lte
+    value: Optional[Any] = None
+    values: Optional[List[Any]] = None
+
+
+class ExcelChartRequest(BaseModel):
+    sheet_name: Optional[str] = None
+    chart_type: str = "bar"  # bar | line | pie
+    x_field: str
+    y_fields: List[str] = []
+    series_field: Optional[str] = None
+    agg: str = "sum"  # sum | count | avg
+    filters: List[ExcelFilter] = []
+    template_id: Optional[str] = None
+
+
+class ExcelChartSeries(BaseModel):
+    name: str
+    data: List[Dict[str, Any]]
+
+
+class ExcelChartResponse(BaseModel):
+    chart_type: str
+    x_field: str
+    y_fields: List[str]
+    series: List[ExcelChartSeries]
+    vega_spec: Optional[Dict[str, Any]] = None
+
+
+class ExcelViewConfig(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+    sheet_name: str
+    chart_type: str
+    agg: str
+    x_field: str
+    y_fields: List[str] = []
+    series_field: Optional[str] = None
+    filters: List[ExcelFilter] = []
+    template_id: Optional[str] = None
+    created_at: int
+    updated_at: int
+
+
+@router.post("/shared/{file_id}/excel/chart", response_model=ExcelChartResponse)
+async def build_shared_excel_chart(
+    file_id: str,
+    config: ExcelChartRequest,
+    user=Depends(get_verified_user),
+):
+    """根据配置构建共享 Excel/CSV 文件的图表数据。
+
+    - 仅支持 space_type == "shared" 的文件；
+    - 根据 sheet/x/y/聚合 等配置使用 pandas 聚合；
+    - 返回统一结构和 Vega-Lite spec，供前端渲染。
+    """
+
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    try:
+        from open_webui.config import UPLOAD_DIR
+
+        if file.path is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File path is empty",
+            )
+
+        if os.path.isabs(file.path):
+            file_path = Path(file.path)
+        else:
+            file_path = Path(UPLOAD_DIR) / file.path
+
+        if not file_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found on disk",
+            )
+
+        chart_dict = build_excel_chart(file_path, config.model_dump())
+
+        series_models = [
+            ExcelChartSeries(name=s["name"], data=s.get("data", []))
+            for s in chart_dict.get("series", [])
+        ]
+
+        return ExcelChartResponse(
+            chart_type=chart_dict.get("chart_type", config.chart_type),
+            x_field=chart_dict.get("x_field", config.x_field),
+            y_fields=chart_dict.get("y_fields", config.y_fields),
+            series=series_models,
+            vega_spec=chart_dict.get("vega_spec"),
+        )
+
+    except HTTPException:
+        raise
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="File not found on disk",
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(f"Error building excel chart: {str(e)}"),
+        )
+
+
+@router.get("/shared/{file_id}/excel/views", response_model=List[ExcelViewConfig])
+async def list_shared_excel_views(
+    file_id: str,
+    user=Depends(get_verified_user),
+):
+    """获取某个共享文件下保存的 Excel 视图列表。"""
+
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    meta = file.meta or {}
+    views_raw = meta.get("excel_views") or []
+    views: List[ExcelViewConfig] = []
+
+    for v in views_raw:
+        try:
+            views.append(ExcelViewConfig(**v))
+        except Exception:
+            # 如果某个视图数据有问题，则跳过
+            continue
+
+    return views
+
+
+class ExcelViewSaveRequest(BaseModel):
+    id: Optional[str] = None  # 不传则创建新视图
+    name: str
+    description: Optional[str] = None
+    sheet_name: str
+    chart_type: str
+    agg: str
+    x_field: str
+    y_fields: List[str] = []
+    series_field: Optional[str] = None
+    filters: List[ExcelFilter] = []
+    template_id: Optional[str] = None
+
+
+@router.post("/shared/{file_id}/excel/views", response_model=ExcelViewConfig)
+async def save_shared_excel_view(
+    file_id: str,
+    view: ExcelViewSaveRequest,
+    user=Depends(get_verified_user),
+):
+    """保存或更新某个共享文件下的 Excel 视图配置。"""
+
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    meta = dict(file.meta or {})
+    views_raw = list(meta.get("excel_views") or [])
+
+    now_ts = int(time.time())
+
+    if view.id:
+        # 更新已有视图
+        updated = None
+        for idx, v in enumerate(views_raw):
+            if v.get("id") == view.id:
+                merged = {
+                    **v,
+                    **view.model_dump(exclude_unset=True),
+                    "updated_at": now_ts,
+                }
+                views_raw[idx] = merged
+                updated = merged
+                break
+
+        if not updated:
+            # 如果传入的 id 在列表中不存在，则按新视图处理
+            view_id = view.id
+            updated = {
+                "id": view_id,
+                **view.model_dump(exclude={"id"}),
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            }
+            views_raw.append(updated)
+    else:
+        # 创建新视图
+        view_id = str(uuid.uuid4())
+        updated = {
+            "id": view_id,
+            **view.model_dump(exclude={"id"}),
+            "created_at": now_ts,
+            "updated_at": now_ts,
+        }
+        views_raw.append(updated)
+
+    meta["excel_views"] = views_raw
+    saved_file = Files.update_file_meta(file_id, meta)
+    if not saved_file:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save excel view",
+        )
+
+    return ExcelViewConfig(**updated)
+
+
+@router.delete("/shared/{file_id}/excel/views/{view_id}", response_model=dict)
+async def delete_shared_excel_view(
+    file_id: str,
+    view_id: str,
+    user=Depends(get_verified_user),
+):
+    """删除某个共享文件下的 Excel 视图配置。"""
+
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    meta = dict(file.meta or {})
+    views_raw = list(meta.get("excel_views") or [])
+
+    new_views = [v for v in views_raw if v.get("id") != view_id]
+    if len(new_views) == len(views_raw):
+        # 没找到要删除的视图，直接返回成功
+        return {"status": "ok"}
+
+    meta["excel_views"] = new_views
+    saved_file = Files.update_file_meta(file_id, meta)
+    if not saved_file:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete excel view",
+        )
+
+    return {"status": "ok"}
 
 
 ############################

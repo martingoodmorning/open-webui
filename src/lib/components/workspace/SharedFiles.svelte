@@ -5,7 +5,13 @@
 
 	import { WEBUI_NAME, user } from '$lib/stores';
 	import { WEBUI_API_BASE_URL } from '$lib/constants';
-	import { getSharedFiles, uploadSharedFile, downloadSharedFile, deleteSharedFile, getSharedFilePreviewUrl } from '$lib/apis/files/shared';
+	import {
+		getSharedFiles,
+		uploadSharedFile,
+		downloadSharedFile,
+		deleteSharedFile,
+		getSharedFilePreviewUrl
+	} from '$lib/apis/files/shared';
 	import { getGroups } from '$lib/apis/groups';
 	import { Select } from 'bits-ui';
 	import { goto } from '$app/navigation';
@@ -27,6 +33,8 @@
 	import Photo from '../icons/Photo.svelte';
 	import Folder from '../icons/Folder.svelte';
 	import ChatBubble from '../icons/ChatBubble.svelte';
+	import ChartBar from '../icons/ChartBar.svelte';
+	import ExcelVisualizer from './ExcelVisualizer.svelte';
 
 	let loaded = false;
 	let loading = false;
@@ -39,6 +47,9 @@
 	let showPreview = false;
 	let previewUrl = '';
 	let loadingPreview = false;
+
+	let showExcelVisualizer = false;
+	let excelFile: any = null;
 
 	let files: any[] = [];
 	let total = 0;
@@ -517,6 +528,26 @@
 		return Document;
 	};
 
+	const isExcelFile = (file: any) => {
+		if (!file) return false;
+		const filename = file.filename?.toLowerCase() || '';
+		const contentType = file.meta?.content_type?.toLowerCase() || '';
+
+		if (['.xls', '.xlsx', '.xlsb', '.csv'].some((ext) => filename.endsWith(ext))) {
+			return true;
+		}
+
+		if (
+			contentType.includes('spreadsheetml') ||
+			contentType.includes('excel') ||
+			contentType === 'text/csv'
+		) {
+			return true;
+		}
+
+		return false;
+	};
+
 	// 获取分组显示名称
 	const getGroupDisplayName = (spaceId: string) => {
 		if (spaceId === 'global') {
@@ -661,6 +692,11 @@
 			console.error('Error loading preview:', error);
 			return '';
 		}
+	};
+
+	const openExcelVisualizerModal = (item: any) => {
+		excelFile = item;
+		showExcelVisualizer = true;
 	};
 
 	// 分组选择器选项
@@ -816,6 +852,44 @@
 							</button>
 						</div>
 					{/if}
+				</div>
+			</div>
+		</Modal>
+	{/if}
+
+	<!-- Excel 可视化模态框 -->
+	{#if showExcelVisualizer && excelFile}
+		<Modal bind:show={showExcelVisualizer} size="3xl">
+			<div class="font-primary px-4.5 py-3.5 w-full flex flex-col dark:text-gray-400">
+				<div class="pb-2">
+					<div class="flex items-start justify-between">
+						<div class="flex-1 min-w-0">
+							<div class="font-medium text-lg dark:text-gray-100 truncate">
+								{excelFile.filename}
+							</div>
+							<div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+								Excel / CSV 可视化配置与预览
+							</div>
+						</div>
+						<button
+							class="flex-shrink-0 p-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-900 transition"
+							on:click={() => {
+								showExcelVisualizer = false;
+								excelFile = null;
+							}}
+						>
+							<XMark className="size-5" />
+						</button>
+					</div>
+				</div>
+
+				<div class="max-h-[75vh] overflow-auto">
+					<ExcelVisualizer
+						file={excelFile}
+						onClose={() => {
+							showExcelVisualizer = false;
+							excelFile = null;
+						}} />
 				</div>
 			</div>
 		</Modal>
@@ -1226,6 +1300,15 @@
 											title="预览"
 										>
 											<Eye className="size-4 text-gray-600 dark:text-gray-400" />
+										</button>
+									{/if}
+									{#if isExcelFile(item)}
+										<button
+											class="p-1.5 rounded-lg hover:bg-green-100 dark:hover:bg-green-900/30 transition text-green-600 dark:text-green-400"
+											on:click={() => openExcelVisualizerModal(item)}
+											title="Excel 可视化"
+										>
+											<ChartBar className="size-4" />
 										</button>
 									{/if}
 									<button

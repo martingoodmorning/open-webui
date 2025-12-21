@@ -220,6 +220,24 @@ class FilesTable:
                 for file in db.query(File).filter_by(user_id=user_id).all()
             ]
 
+    def update_file_meta(self, id: str, meta: dict) -> Optional[FileModel]:
+        """更新指定文件的 meta 字段，并返回更新后的 FileModel。"""
+        with get_db() as db:
+            try:
+                file = db.get(File, id)
+                if not file:
+                    return None
+                file.meta = meta
+                file.updated_at = int(time.time())
+                db.add(file)
+                db.commit()
+                db.refresh(file)
+                return FileModel.model_validate(file)
+            except Exception as e:
+                log.exception(f"Error updating file meta: {e}")
+                db.rollback()
+                return None
+
     def get_shared_files(
         self,
         space_id: Optional[str] = None,
