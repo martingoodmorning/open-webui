@@ -843,12 +843,21 @@ for file_path in (FRONTEND_BUILD_DIR / "static").glob("**/*"):
             logging.error(f"An error occurred: {e}")
 
 frontend_favicon = FRONTEND_BUILD_DIR / "static" / "favicon.png"
+# 项目根目录（OPEN_WEBUI_DIR 是 backend/open_webui，所以 parent.parent 是项目根目录）
+project_root = OPEN_WEBUI_DIR.parent.parent
+root_static_favicon = project_root / "static" / "favicon.png"
 
+# 优先从前端构建目录复制，如果不存在则从项目根目录的 static 复制
 if frontend_favicon.exists():
     try:
         shutil.copyfile(frontend_favicon, STATIC_DIR / "favicon.png")
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
+        logging.error(f"An error occurred copying favicon from frontend build: {e}")
+elif root_static_favicon.exists():
+    try:
+        shutil.copyfile(root_static_favicon, STATIC_DIR / "favicon.png")
+    except Exception as e:
+        logging.error(f"An error occurred copying favicon from root static: {e}")
 
 frontend_splash = FRONTEND_BUILD_DIR / "static" / "splash.png"
 

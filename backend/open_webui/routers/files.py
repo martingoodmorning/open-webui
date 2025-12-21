@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 import asyncio
+import subprocess
+import tempfile
 
 from fastapi import (
     BackgroundTasks,
@@ -73,6 +75,15 @@ def has_access_to_file(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
+    # 检查共享文件访问权限
+    if file.space_type == "shared":
+        return has_shared_file_access(file, user)
+
+    # 检查个人文件：文件所有者可以访问
+    if file.user_id == user.id:
+        return True
+
+    # 检查知识库文件访问权限
     knowledge_bases = Knowledges.get_knowledges_by_file_id(file_id)
     user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
 
@@ -92,6 +103,723 @@ def has_access_to_file(
                 return True
 
     return False
+
+
+############################
+# Shared Files - Permission Check
+############################
+
+
+def has_shared_file_access(file: FileModel, user) -> bool:
+    """
+    检查用户是否有权限访问共享文件
+    - 全局共享文件（space_id='global'）：所有用户可访问
+    - 分组文件：用户必须属于该分组
+    - 管理员：可以访问所有文件
+    """
+    if not file or file.space_type != "shared":
+        return False
+
+    # 管理员可以访问所有文件
+    if user.role == "admin":
+        return True
+
+    # 全局共享文件，所有用户可访问
+    if file.space_id == "global":
+        return True
+
+    # 分组文件，检查用户是否属于该分组
+    if file.space_id:
+        user_groups = Groups.get_groups_by_member_id(user.id)
+        user_group_ids = {g.id for g in user_groups}
+        return file.space_id in user_group_ids
+
+    return False
+
+
+def get_user_accessible_group_ids(user) -> Optional[set[str]]:
+    """获取用户可访问的分组ID列表（包括全局共享）"""
+    if user.role == "admin":
+        # 管理员可以访问所有分组，返回 None 表示不过滤
+        return None
+
+    user_groups = Groups.get_groups_by_member_id(user.id)
+    user_group_ids = {g.id for g in user_groups}
+    # 添加 'global' 表示全局共享
+    user_group_ids.add("global")
+    return user_group_ids
+
+
+############################
+# Shared Files - List
+############################
+
+
+@router.get("/shared", response_model=dict)
+async def list_shared_files(
+    user=Depends(get_verified_user),
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页数量"),
+    group_id: Optional[str] = Query(None, description="分组ID，不传则返回所有有权限的文件"),
+    order_by: str = Query("updated_at", description="排序字段"),
+    order: str = Query("desc", description="排序方向：asc 或 desc"),
+    search: Optional[str] = Query(None, description="搜索关键词（文件名模糊匹配）"),
+    file_type: Optional[str] = Query(None, description="文件类型过滤：pdf, image, office, text"),
+    start_date: Optional[int] = Query(None, description="开始时间戳（Unix timestamp）"),
+    end_date: Optional[int] = Query(None, description="结束时间戳（Unix timestamp）"),
+):
+    """
+    获取共享文件列表
+    - 只返回用户有权限访问的文件
+    - 支持按分组过滤
+    - 支持分页和排序
+    - 支持搜索（文件名模糊匹配）
+    - 支持文件类型过滤
+    - 支持时间范围过滤
+    """
+    # 获取用户可访问的分组ID
+    accessible_group_ids = get_user_accessible_group_ids(user)
+
+    # 如果指定了 group_id，验证权限
+    if group_id:
+        # 全局共享不需要验证分组存在性
+        if group_id == "global":
+            space_id = group_id
+        else:
+            # 验证分组是否存在
+            group = Groups.get_group_by_id(group_id)
+            if not group:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Group not found",
+                )
+            
+            # 检查用户是否有权限访问该分组
+            if accessible_group_ids is not None and group_id not in accessible_group_ids:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You don't have access to this group",
+                )
+            space_id = group_id
+    else:
+        space_id = None
+
+    # 查询共享文件
+    files, total = Files.get_shared_files(
+        space_id=space_id,
+        page=page,
+        page_size=page_size,
+        order_by=order_by,
+        order=order,
+        search=search,
+        file_type=file_type,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    # 过滤掉用户无权限的文件（双重检查）
+    accessible_files = []
+    for file in files:
+        if has_shared_file_access(file, user):
+            accessible_files.append(file)
+
+    return {
+        "items": accessible_files,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+############################
+# Shared Files - Download
+############################
+
+
+@router.get("/shared/{file_id}/download")
+async def download_shared_file(
+    file_id: str,
+    user=Depends(get_verified_user),
+    attachment: bool = Query(True, description="是否作为附件下载"),
+):
+    """
+    下载共享文件
+    - 检查用户是否有权限访问该文件
+    - 支持作为附件下载或内联显示
+    """
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # 检查是否是共享文件
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    # 检查用户是否有权限访问
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    try:
+        # 获取文件路径（共享文件路径是相对路径，需要加上 UPLOAD_DIR）
+        from open_webui.config import UPLOAD_DIR
+        
+        # 如果路径已经是绝对路径，直接使用；否则拼接 UPLOAD_DIR
+        if os.path.isabs(file.path):
+            file_path = file.path
+        else:
+            file_path = os.path.join(UPLOAD_DIR, file.path)
+        
+        file_path = Path(file_path)
+
+        # 检查文件是否存在
+        if not file_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found on disk",
+            )
+
+        # 处理文件名和内容类型（优先使用原文件名）
+        # 原文件名存储在 file.meta["name"] 或 file.filename 中
+        if file.meta and "name" in file.meta:
+            filename = file.meta["name"]  # 优先使用 meta 中的原文件名
+            log.debug(f"Using filename from meta.name: {filename}")
+        else:
+            filename = file.filename  # 如果没有 meta.name，使用 filename
+            log.debug(f"Using filename from file.filename: {filename}")
+        
+        # 确保文件名不为空
+        if not filename:
+            # 从文件路径中提取原文件名（去除 UUID 前缀）
+            path_name = file_path.name
+            # 如果文件名格式是 {uuid}_{original_name}，提取原文件名
+            if '_' in path_name:
+                parts = path_name.split('_', 1)
+                if len(parts) == 2 and len(parts[0]) == 36:  # UUID 长度为 36
+                    filename = parts[1]  # 使用原文件名部分
+                    log.debug(f"Extracted filename from path: {filename}")
+                else:
+                    filename = path_name
+            else:
+                filename = path_name
+            log.debug(f"Using filename from path: {filename}")
+        
+        encoded_filename = quote(filename)  # RFC5987 encoding
+        log.debug(f"Final filename for download: {filename}, encoded: {encoded_filename}")
+        content_type = file.meta.get("content_type") if file.meta else None
+
+        headers = {}
+
+        if attachment:
+            headers["Content-Disposition"] = (
+                f"attachment; filename*=UTF-8''{encoded_filename}"
+            )
+        else:
+            # 对于 PDF，内联显示
+            if content_type == "application/pdf" or filename.lower().endswith(".pdf"):
+                headers["Content-Disposition"] = (
+                    f"inline; filename*=UTF-8''{encoded_filename}"
+                )
+                content_type = "application/pdf"
+            else:
+                headers["Content-Disposition"] = (
+                    f"attachment; filename*=UTF-8''{encoded_filename}"
+                )
+
+        return FileResponse(
+            file_path,
+            headers=headers,
+            media_type=content_type,
+            filename=filename,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(e)
+        log.error(f"Error downloading shared file: {file_id}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(f"Error downloading file: {str(e)}"),
+        )
+
+
+############################
+# Shared Files - Preview (Convert Office to PDF)
+############################
+
+
+def _is_office_document(filename: str, content_type: str) -> bool:
+    """检查是否是 Office 文档"""
+    filename_lower = filename.lower()
+    content_type_lower = content_type.lower()
+    return (
+        filename_lower.endswith(('.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx')) or
+        content_type_lower in (
+            'application/msword',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-powerpoint',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        )
+    )
+
+
+def convert_office_to_pdf(file_path: Path) -> Optional[Path]:
+    """
+    将 Office 文档转换为 PDF
+    支持: .doc, .docx, .xls, .xlsx, .ppt, .pptx
+    需要系统安装 LibreOffice
+    使用优化的转换工具，支持中文字体和 Excel 单页显示
+    """
+    from open_webui.utils.office_converter import convert_office_to_pdf as convert_with_utils
+    
+    return convert_with_utils(file_path)
+
+
+@router.get("/shared/{file_id}/preview")
+async def preview_shared_file(
+    file_id: str,
+    user=Depends(get_verified_user),
+    force: bool = Query(False, description="强制重新生成预览"),
+):
+    """
+    预览共享文件（Office 文档转换为 PDF）
+    - 如果是 Office 文档，转换为 PDF 后返回
+    - 如果是 PDF，直接返回
+    - 其他格式返回错误
+    """
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # 检查是否是共享文件
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    # 检查用户是否有权限访问
+    if not has_shared_file_access(file, user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to access this file",
+        )
+
+    try:
+        from open_webui.config import UPLOAD_DIR
+        
+        # 获取文件路径
+        if os.path.isabs(file.path):
+            file_path = Path(file.path)
+        else:
+            file_path = Path(UPLOAD_DIR) / file.path
+
+        if not file_path.is_file():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File not found on disk",
+            )
+
+        filename = file.filename or file_path.name
+        content_type = file.meta.get('content_type', '')
+        is_office = _is_office_document(filename, content_type)
+        is_pdf = filename.lower().endswith('.pdf') or content_type.lower() == 'application/pdf'
+
+        # 如果是 PDF，直接返回
+        if is_pdf:
+            return FileResponse(
+                file_path,
+                headers={
+                    "Content-Type": "application/pdf",
+                    "Content-Disposition": f'inline; filename*=UTF-8''{quote(filename)}'
+                }
+            )
+
+        # 如果是 Office 文档，转换为 PDF
+        if is_office:
+            pdf_path = file_path.parent / f"{file_path.stem}_preview.pdf"
+            
+            # 优先使用缓存：仅在 PDF 不存在、过期或损坏时重新转换
+            if pdf_path.exists():
+                # 检查 PDF 是否有效（文件大小 > 0 且比原文件新）
+                if pdf_path.stat().st_size > 0 and pdf_path.stat().st_mtime >= file_path.stat().st_mtime:
+                    # 缓存有效，直接返回
+                    return FileResponse(
+                        pdf_path,
+                        headers={
+                            "Content-Type": "application/pdf",
+                            "Content-Disposition": f'inline; filename*=UTF-8''{quote(file_path.stem + ".pdf")}'
+                        }
+                    )
+                # PDF 无效，删除旧缓存
+                try:
+                    pdf_path.unlink()
+                    log.info(f"Removed invalid preview cache: {pdf_path}")
+                except Exception as e:
+                    log.warning(f"Failed to remove invalid preview cache: {e}")
+            
+            # PDF 不存在或无效，尝试转换（如果后台转换还在进行中，会返回 503）
+            try:
+                converted_pdf = convert_office_to_pdf(file_path)
+                if converted_pdf and converted_pdf.exists():
+                    pdf_path = converted_pdf
+                else:
+                    # 转换失败或后台转换还在进行中
+                    log.warning(f"PDF preview not available for file: {file_id}, may still be generating")
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail="PDF preview is being generated, please try again in a few seconds."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                log.exception(e)
+                log.error(f"Error converting Office document to PDF: {file_id}, error: {str(e)}")
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="PDF preview is being generated, please try again in a few seconds."
+                )
+
+            return FileResponse(
+                pdf_path,
+                headers={
+                    "Content-Type": "application/pdf",
+                    "Content-Disposition": f'inline; filename*=UTF-8''{quote(file_path.stem + ".pdf")}'
+                }
+            )
+
+        # 其他格式不支持预览
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This file type cannot be previewed. Only Office documents and PDFs are supported."
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(e)
+        log.error(f"Error previewing shared file: {file_id}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(f"Error previewing file: {str(e)}"),
+        )
+
+
+############################
+# Shared Files - Delete
+############################
+
+
+@router.delete("/shared/{file_id}")
+async def delete_shared_file(
+    file_id: str,
+    user=Depends(get_verified_user),
+):
+    """
+    删除共享文件
+    - 检查用户是否有权限删除（上传者、分组管理员或系统管理员）
+    - 删除物理文件
+    - 清理向量索引（如果存在）
+    - 清理知识库关联（如果存在）
+    """
+    file = Files.get_file_by_id(file_id)
+
+    if not file:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # 检查是否是共享文件
+    if file.space_type != "shared":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This is not a shared file",
+        )
+
+    # 检查删除权限
+    # 1. 文件上传者可以删除
+    # 2. 系统管理员可以删除
+    # 3. 分组管理员可以删除（如果文件属于某个分组）
+    is_file_owner = file.user_id == user.id
+    is_admin = user.role == "admin"
+    is_group_admin = False
+
+    # 检查是否是分组管理员
+    if file.space_id and file.space_id != "global":
+        group = Groups.get_group_by_id(file.space_id)
+        if group and group.user_id == user.id:
+            is_group_admin = True
+
+    if not (is_file_owner or is_admin or is_group_admin):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to delete this file",
+        )
+
+    try:
+        # 1. 删除物理文件
+        from open_webui.config import UPLOAD_DIR
+        
+        if file.path:
+            # 构建完整文件路径
+            if os.path.isabs(file.path):
+                file_path = file.path
+            else:
+                file_path = os.path.join(UPLOAD_DIR, file.path)
+            
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                log.info(f"Deleted physical file: {file_path}")
+
+        # 2. 清理向量索引（如果存在）
+        try:
+            VECTOR_DB_CLIENT.delete(collection_name=f"file-{file_id}")
+            log.debug(f"Cleaned vector index for file: {file_id}")
+        except Exception as e:
+            log.warning(f"Failed to clean vector index: {e}")
+
+        # 3. 清理知识库关联（如果存在）
+        # 知识库关联会在删除文件记录时自动处理（如果数据库有外键约束）
+        # 这里可以添加额外的清理逻辑
+        log.debug(f"Cleaning knowledge base associations for file: {file_id}")
+
+        # 4. 删除数据库记录
+        success = Files.delete_file_by_id(file_id)
+        
+        if success:
+            return {
+                "status": True,
+                "message": "File deleted successfully",
+                "file_id": file_id,
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete file record from database",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(e)
+        log.error(f"Error deleting shared file: {file_id}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=ERROR_MESSAGES.DEFAULT(f"Error deleting file: {str(e)}"),
+        )
+
+
+############################
+# Shared Files - Upload
+############################
+
+
+@router.post("/shared", response_model=FileModelResponse)
+def upload_shared_file(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    group_id: Optional[str] = Form(None, description="分组ID，不传则上传到全局共享"),
+    metadata: Optional[dict | str] = Form(None),
+    process: bool = Query(True),
+    process_in_background: bool = Query(True),
+    user=Depends(get_verified_user),
+):
+    """
+    上传文件到共享空间
+    - group_id: 分组ID，不传或传 'global' 表示全局共享
+    - 验证用户是否有权限上传到指定分组
+    """
+    # 确定 space_id
+    if not group_id or group_id == "global":
+        space_id = "global"
+    else:
+        # 验证分组是否存在
+        group = Groups.get_group_by_id(group_id)
+        if not group:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Group not found",
+            )
+        
+        # 验证用户是否有权限上传到该分组
+        accessible_group_ids = get_user_accessible_group_ids(user)
+        if accessible_group_ids is not None and group_id not in accessible_group_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You don't have permission to upload to this group",
+            )
+        space_id = group_id
+
+    # 解析 metadata
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT("Invalid metadata format"),
+            )
+    file_metadata = metadata if metadata else {}
+
+    try:
+        # 文件名安全处理
+        unsanitized_filename = file.filename
+        filename = os.path.basename(unsanitized_filename)
+        # 移除路径分隔符，防止路径遍历攻击
+        filename = filename.replace("/", "_").replace("\\", "_")
+
+        file_extension = os.path.splitext(filename)[1]
+        file_extension = file_extension[1:] if file_extension else ""
+
+        # 文件类型验证（复用现有配置）
+        if process and request.app.state.config.ALLOWED_FILE_EXTENSIONS:
+            request.app.state.config.ALLOWED_FILE_EXTENSIONS = [
+                ext for ext in request.app.state.config.ALLOWED_FILE_EXTENSIONS if ext
+            ]
+            if file_extension not in request.app.state.config.ALLOWED_FILE_EXTENSIONS:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT(
+                        f"File type {file_extension} is not allowed"
+                    ),
+                )
+
+        # 生成文件ID和路径
+        id = str(uuid.uuid4())
+        name = filename
+        filename = f"{id}_{filename}"
+
+        # 确定存储路径（共享文件存储到 shared/ 目录）
+        if space_id == "global":
+            storage_subpath = "shared/global"
+        else:
+            storage_subpath = f"shared/groups/{space_id}"
+
+        # 读取文件内容
+        contents = file.file.read()
+        if not contents:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=ERROR_MESSAGES.DEFAULT("File is empty"),
+            )
+
+        # 手动构建共享文件的存储路径
+        from open_webui.config import UPLOAD_DIR
+        
+        # 创建子目录（如果不存在）
+        shared_dir = os.path.join(UPLOAD_DIR, storage_subpath)
+        os.makedirs(shared_dir, exist_ok=True)
+        
+        # 保存文件（绝对路径，保持与 Storage.upload_file 返回格式一致）
+        file_path = os.path.join(shared_dir, filename)
+        with open(file_path, "wb") as f:
+            f.write(contents)
+
+        # 创建文件记录（设置为共享文件）
+        # 使用相对路径存储（与现有文件存储格式一致）
+        file_item = Files.insert_new_file(
+            user.id,
+            FileForm(
+                **{
+                    "id": id,
+                    "filename": name,
+                    # 这里直接保存绝对路径，便于后续 content extraction / RAG 复用 Storage.get_file 逻辑
+                    "path": file_path,
+                    "space_type": "shared",  # 标记为共享文件
+                    "space_id": space_id,    # 设置分组ID或'global'
+                    "data": {
+                        **({"status": "pending"} if process else {}),
+                    },
+                    "meta": {
+                        "name": name,
+                        "content_type": file.content_type,
+                        "size": len(contents),
+                        "data": file_metadata,
+                    },
+                }
+            ),
+        )
+
+        # 检查是否是 Office 文档，如果是则添加后台转换任务（生成预览PDF缓存）
+        # 注意：PDF只是预览缓存，不影响原文件
+        is_office = _is_office_document(name, file.content_type or '')
+        
+        # 如果是 Office 文档，添加后台转换任务（上传后自动转换PDF预览，用户点击预览时无需等待）
+        if is_office and background_tasks:
+            def convert_office_preview():
+                """后台转换 Office 文档为 PDF 预览（仅用于预览，不影响原文件）"""
+                try:
+                    file_path_obj = Path(file_path)
+                    log.info(f"Starting background conversion for Office file: {file_path_obj.name}")
+                    converted_pdf = convert_office_to_pdf(file_path_obj)
+                    if converted_pdf:
+                        log.info(f"Successfully converted Office file to PDF preview: {converted_pdf}")
+                    else:
+                        log.warning(f"Failed to convert Office file to PDF: {file_path_obj.name}")
+                except Exception as e:
+                    log.exception(f"Error in background Office conversion: {e}")
+            
+            # 添加后台转换任务（不阻塞上传响应）
+            background_tasks.add_task(convert_office_preview)
+            log.info(f"Added background conversion task for Office file: {name} (PDF preview will be ready for viewing)")
+
+        if process:
+            if background_tasks and process_in_background:
+                background_tasks.add_task(
+                    process_uploaded_file,
+                    request,
+                    file,
+                    file_path,
+                    file_item,
+                    file_metadata,
+                    user,
+                )
+                return {"status": True, **file_item.model_dump()}
+            else:
+                process_uploaded_file(
+                    request,
+                    file,
+                    file_path,
+                    file_item,
+                    file_metadata,
+                    user,
+                )
+                return {"status": True, **file_item.model_dump()}
+        else:
+            if file_item:
+                return file_item
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.DEFAULT("Error uploading file"),
+                )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception(e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.DEFAULT(f"Error uploading shared file: {str(e)}"),
+        )
 
 
 ############################

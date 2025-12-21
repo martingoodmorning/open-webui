@@ -35,7 +35,7 @@ export const uploadFile = async (token: string, file: File, metadata?: object | 
 	if (res) {
 		const status = await getFileProcessStatus(token, res.id);
 
-		if (status && status.ok) {
+		if (status && status.ok && status.body) {
 			const reader = status.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))

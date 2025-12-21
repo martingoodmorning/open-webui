@@ -9,6 +9,7 @@ import sys
 import time
 import random
 import re
+from pathlib import Path
 from uuid import uuid4
 
 
@@ -1652,7 +1653,7 @@ async def chat_completion(
                         {"type": "chat:tasks:cancel"},
                     )
                 )
-            except Exception as e:
+            except Exception:
                 pass
             finally:
                 raise  # re-raise to ensure proper task cancellation handling
@@ -1682,7 +1683,7 @@ async def chat_completion(
                         {"type": "chat:tasks:cancel"},
                     )
 
-                except:
+                except Exception:
                     pass
         finally:
             try:
@@ -1694,18 +1695,24 @@ async def chat_completion(
                 pass
 
     # NOTE:
-    # 原本这里在 session_id / chat_id / message_id 都存在时，会走异步任务队列：
+    # 在 session_id / chat_id / message_id 都存在时，走异步任务队列：
     #   - create_task(...) 返回 task_id
-    #   - 前端再通过 /api/tasks/chat/{chat_id} 轮询进度
-    # 但在当前环境下，任务队列 / Redis 配置不完整，导致带文档的聊天拿到 task_id 却查不到结果，
-    # 前端一直卡在“查询中”。为保证功能可用，这里暂时改为**始终同步处理**。
+    #   - 前端通过 /api/tasks/chat/{chat_id} 或 WebSocket 事件跟踪进度
+    # 这样长对话或带文档检索的请求不会长时间阻塞 HTTP 连接。
     #
-    # 后续如果要恢复异步，只需还原为：
-    #   if metadata.get("session_id") and metadata.get("chat_id") and metadata.get("message_id"):
-    #       task_id, _ = await create_task(...)
-    #       return {"status": True, "task_id": task_id}
-    #
-    # 现在统一直接返回模型结果，避免依赖任务队列。
+    # 如果缺少这三项（例如外部脚本直接调用 API），则同步执行并直接返回模型结果。
+    if (
+        metadata.get("session_id")
+        and metadata.get("chat_id")
+        and metadata.get("message_id")
+    ):
+        task_id, _ = await create_task(
+            request.app.state.redis,
+            process_chat(request, form_data, user, metadata, model),
+            metadata.get("chat_id"),
+        )
+        return {"status": True, "task_id": task_id}
+
     return await process_chat(request, form_data, user, metadata, model)
 
 
@@ -2280,7 +2287,49 @@ async def healthcheck_with_db():
     return {"status": True}
 
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# 在静态文件挂载之前定义 favicon 端点，确保优先匹配
+@app.get("/favicon.png")
+@app.get("/static/favicon.png")
+async def get_favicon(request: Request):
+    """
+    返回 favicon.png，通过 API 端点避免 CORS 问题
+    支持 /favicon.png 和 /static/favicon.png 两个路径
+    """
+    # 优先从 STATIC_DIR 获取
+    favicon_path = STATIC_DIR / "favicon.png"
+    if favicon_path.exists():
+        response = FileResponse(str(favicon_path), media_type="image/png")
+        # 手动添加 CORS 头（确保跨域访问）
+        origin = request.headers.get("origin")
+        if origin:
+            # 检查 origin 是否在允许列表中
+            if isinstance(CORS_ALLOW_ORIGIN, list):
+                if origin in CORS_ALLOW_ORIGIN:
+                    response.headers["Access-Control-Allow-Origin"] = origin
+                    response.headers["Access-Control-Allow-Credentials"] = "true"
+            elif CORS_ALLOW_ORIGIN == "*":
+                response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+    
+    # 尝试从项目根目录的 static 获取
+    project_root = Path(__file__).parent.parent.parent
+    root_favicon = project_root / "static" / "favicon.png"
+    if root_favicon.exists():
+        response = FileResponse(str(root_favicon), media_type="image/png")
+        # 手动添加 CORS 头（确保跨域访问）
+        origin = request.headers.get("origin")
+        if origin:
+            # 检查 origin 是否在允许列表中
+            if isinstance(CORS_ALLOW_ORIGIN, list):
+                if origin in CORS_ALLOW_ORIGIN:
+                    response.headers["Access-Control-Allow-Origin"] = origin
+                    response.headers["Access-Control-Allow-Credentials"] = "true"
+            elif CORS_ALLOW_ORIGIN == "*":
+                response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+    
+    # 如果都不存在，返回 404
+    return Response(status_code=status.HTTP_404_NOT_FOUND)
 
 
 @app.get("/cache/{path:path}")

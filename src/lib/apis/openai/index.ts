@@ -361,7 +361,7 @@ export const chatCompletion = async (
 
 export const generateOpenAIChatCompletion = async (
 	token: string = '',
-	body: object,
+	body: any,
 	url: string = `${WEBUI_BASE_URL}/api`
 ) => {
 	let error = null;
@@ -376,7 +376,24 @@ export const generateOpenAIChatCompletion = async (
 		body: JSON.stringify(body)
 	})
 		.then(async (res) => {
-			if (!res.ok) throw await res.json();
+			if (!res.ok) {
+				// Try to parse error payload, fall back to status text
+				let err: any;
+				try {
+					err = await res.json();
+				} catch {
+					err = await res.text();
+				}
+				throw err;
+			}
+
+			// For streaming responses (stream: true), the body is an event stream, not JSON.
+			// We don't need the body in that case – just confirm the request succeeded.
+			if (body?.stream) {
+				return { status: true };
+			}
+
+			// Non-streaming responses should be valid JSON (OpenAI-style)
 			return res.json();
 		})
 		.catch((err) => {

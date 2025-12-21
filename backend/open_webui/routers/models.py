@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_access, has_permission
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STATIC_DIR
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -289,18 +290,41 @@ async def get_model_by_id(id: str, user=Depends(get_verified_user)):
 
 
 @router.get("/model/profile/image")
-async def get_model_profile_image(id: str, user=Depends(get_verified_user)):
+async def get_model_profile_image(id: Optional[str] = None, user=Depends(get_verified_user)):
+    # 获取默认头像路径（优先使用项目根目录的 static/favicon.png）
+    def get_default_favicon_path():
+        # 尝试多个可能的路径
+        possible_paths = [
+            Path(__file__).parent.parent.parent.parent / "static" / "favicon.png",  # 项目根目录
+            STATIC_DIR / "favicon.png",  # STATIC_DIR 配置的路径
+            Path(__file__).parent / "static" / "favicon.png",  # backend/open_webui/static
+        ]
+        for path in possible_paths:
+            if path.exists():
+                return path
+        return None
+    
+    # 如果 id 为空或 undefined，直接返回默认头像
+    if not id or id == "undefined":
+        favicon_path = get_default_favicon_path()
+        if favicon_path:
+            return FileResponse(str(favicon_path))
+        else:
+            # 如果都不存在，返回 404
+            return Response(status_code=status.HTTP_404_NOT_FOUND)
+    
     model = Models.get_model_by_id(id)
-    if model:
-        if model.meta.profile_image_url:
-            if model.meta.profile_image_url.startswith("http"):
+    if model and model.meta:
+        profile_image_url = model.meta.get("profile_image_url") if isinstance(model.meta, dict) else getattr(model.meta, "profile_image_url", None)
+        if profile_image_url:
+            if profile_image_url.startswith("http"):
                 return Response(
                     status_code=status.HTTP_302_FOUND,
-                    headers={"Location": model.meta.profile_image_url},
+                    headers={"Location": profile_image_url},
                 )
-            elif model.meta.profile_image_url.startswith("data:image"):
+            elif profile_image_url.startswith("data:image"):
                 try:
-                    header, base64_data = model.meta.profile_image_url.split(",", 1)
+                    header, base64_data = profile_image_url.split(",", 1)
                     image_data = base64.b64decode(base64_data)
                     image_buffer = io.BytesIO(image_data)
 
@@ -310,11 +334,16 @@ async def get_model_profile_image(id: str, user=Depends(get_verified_user)):
                         headers={"Content-Disposition": "inline; filename=image.png"},
                     )
                 except Exception as e:
+                    log.debug(f"Error decoding base64 image: {e}")
                     pass
 
-        return FileResponse(f"{STATIC_DIR}/favicon.png")
+    # 返回默认头像
+    favicon_path = get_default_favicon_path()
+    if favicon_path:
+        return FileResponse(str(favicon_path))
     else:
-        return FileResponse(f"{STATIC_DIR}/favicon.png")
+        # 如果都不存在，返回 404
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
 
 
 ############################

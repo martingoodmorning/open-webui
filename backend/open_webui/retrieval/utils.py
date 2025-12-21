@@ -1024,7 +1024,7 @@ async def get_sources_from_items(
                     "documents": [[content]],
                     "metadatas": [[{"url": item.get("url"), "name": item.get("url")}]],
                 }
-        elif item.get("type") == "file":
+        elif item.get("type") in ("file", "doc"):
             if (
                 item.get("context") == "full"
                 or request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL

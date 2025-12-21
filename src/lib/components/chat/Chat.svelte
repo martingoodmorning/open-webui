@@ -2010,17 +2010,8 @@
 			return null;
 		});
 
-		if (res) {
-			if (res.error) {
-				await handleOpenAIError(res.error, responseMessage);
-			} else {
-				if (taskIds) {
-					taskIds.push(res.task_id);
-				} else {
-					taskIds = [res.task_id];
-				}
-			}
-		}
+		// For streaming chat, we rely on socket events (chat:completion) to update the UI.
+		// The HTTP response is only used for error signaling, which is handled in the catch block above.
 
 		await tick();
 		scrollToBottom();

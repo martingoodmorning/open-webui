@@ -12,6 +12,9 @@
 .cursorrules.jsonp7
 .cursorrules.jsonp8
 .cursorrules.jsonp9
+
+#文档
+*.md
 #其他文件
 x.py
 yarn.lock

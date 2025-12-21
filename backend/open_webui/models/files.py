@@ -5,7 +5,7 @@ from typing import Optional
 from open_webui.internal.db import Base, JSONField, get_db
 from open_webui.env import SRC_LOG_LEVELS
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import BigInteger, Column, String, Text, JSON
+from sqlalchemy import BigInteger, Column, String, Text, JSON, or_
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["MODELS"])
@@ -29,6 +29,10 @@ class File(Base):
 
     access_control = Column(JSON, nullable=True)
 
+    # 共享文件空间字段
+    space_type = Column(String(20), default="personal")  # 'personal' | 'shared'
+    space_id = Column(String(255), nullable=True)  # 个人文件为user_id，共享文件为'global'或group_id
+
     created_at = Column(BigInteger)
     updated_at = Column(BigInteger)
 
@@ -47,6 +51,10 @@ class FileModel(BaseModel):
     meta: Optional[dict] = None
 
     access_control: Optional[dict] = None
+
+    # 共享文件空间字段
+    space_type: Optional[str] = "personal"  # 'personal' | 'shared'
+    space_id: Optional[str] = None  # 个人文件为user_id，共享文件为'global'或group_id
 
     created_at: Optional[int]  # timestamp in epoch
     updated_at: Optional[int]  # timestamp in epoch
@@ -96,6 +104,8 @@ class FileForm(BaseModel):
     data: dict = {}
     meta: dict = {}
     access_control: Optional[dict] = None
+    space_type: Optional[str] = "personal"  # 'personal' | 'shared'
+    space_id: Optional[str] = None  # 个人文件为user_id，共享文件为'global'或group_id
 
 
 class FileUpdateForm(BaseModel):
@@ -209,6 +219,111 @@ class FilesTable:
                 FileModel.model_validate(file)
                 for file in db.query(File).filter_by(user_id=user_id).all()
             ]
+
+    def get_shared_files(
+        self,
+        space_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20,
+        order_by: str = "updated_at",
+        order: str = "desc",
+        search: Optional[str] = None,
+        file_type: Optional[str] = None,
+        start_date: Optional[int] = None,
+        end_date: Optional[int] = None,
+    ) -> tuple[list[FileModel], int]:
+        """
+        获取共享文件列表
+        Args:
+            space_id: 空间ID（'global' 或 group_id），None 表示所有共享文件
+            page: 页码
+            page_size: 每页数量
+            order_by: 排序字段
+            order: 排序方向（'asc' | 'desc'）
+            search: 搜索关键词（文件名模糊匹配）
+            file_type: 文件类型过滤（如 'pdf', 'image', 'office'）
+            start_date: 开始时间戳（Unix timestamp）
+            end_date: 结束时间戳（Unix timestamp）
+        Returns:
+            (文件列表, 总数)
+        """
+        with get_db() as db:
+            query = db.query(File).filter_by(space_type="shared")
+
+            # 如果指定了 space_id，则过滤
+            if space_id:
+                query = query.filter_by(space_id=space_id)
+
+            # 搜索关键词（文件名模糊匹配）
+            if search:
+                search_pattern = f"%{search}%"
+                query = query.filter(File.filename.ilike(search_pattern))
+
+            # 文件类型过滤
+            if file_type:
+                if file_type == "pdf":
+                    query = query.filter(
+                        or_(
+                            File.filename.ilike("%.pdf"),
+                            File.meta["content_type"].astext == "application/pdf"
+                        )
+                    )
+                elif file_type == "image":
+                    query = query.filter(
+                        or_(
+                            File.filename.ilike("%.jpg"),
+                            File.filename.ilike("%.jpeg"),
+                            File.filename.ilike("%.png"),
+                            File.filename.ilike("%.gif"),
+                            File.filename.ilike("%.webp"),
+                            File.filename.ilike("%.svg"),
+                            File.meta["content_type"].astext.like("image/%")
+                        )
+                    )
+                elif file_type == "office":
+                    query = query.filter(
+                        or_(
+                            File.filename.ilike("%.doc%"),
+                            File.filename.ilike("%.xls%"),
+                            File.filename.ilike("%.ppt%"),
+                            File.meta["content_type"].astext.like("application/msword%"),
+                            File.meta["content_type"].astext.like("application/vnd.openxmlformats%"),
+                            File.meta["content_type"].astext.like("application/vnd.ms-%")
+                        )
+                    )
+                elif file_type == "text":
+                    query = query.filter(
+                        or_(
+                            File.filename.ilike("%.txt"),
+                            File.filename.ilike("%.md"),
+                            File.filename.ilike("%.json"),
+                            File.filename.ilike("%.xml"),
+                            File.filename.ilike("%.csv"),
+                            File.meta["content_type"].astext.like("text/%")
+                        )
+                    )
+
+            # 时间范围过滤
+            if start_date:
+                query = query.filter(File.created_at >= start_date)
+            if end_date:
+                query = query.filter(File.created_at <= end_date)
+
+            # 获取总数
+            total = query.count()
+
+            # 排序
+            order_column = getattr(File, order_by, File.updated_at)
+            if order == "desc":
+                query = query.order_by(order_column.desc())
+            else:
+                query = query.order_by(order_column.asc())
+
+            # 分页
+            offset = (page - 1) * page_size
+            files = query.offset(offset).limit(page_size).all()
+
+            return [FileModel.model_validate(file) for file in files], total
 
     def update_file_by_id(
         self, id: str, form_data: FileUpdateForm
